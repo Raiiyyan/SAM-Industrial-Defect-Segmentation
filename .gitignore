@@ -1,0 +1,6 @@
+.venv/
+*.pth
+bottle/
+sample_data/
+.DS_Store
+__pycache__/
