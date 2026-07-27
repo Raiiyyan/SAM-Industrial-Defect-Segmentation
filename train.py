@@ -2,13 +2,15 @@
 
 Trains on all 6 industrial-defect datasets with a combined
 Dice + BCE (mask) and CrossEntropy (class) loss.
+Tuned for RTX 3050 6 GB laptop GPU (Ampere).
 
 Usage::
 
-    python train.py --checkpoint sam_vit_b_01ec64.pth --root-dir G:/Dataset
+    python train.py --checkpoint sam_vit_b_01ec64.pth --root-dir D:/Dataset
 """
 
 import argparse
+import gc
 import logging
 import os
 import sys
@@ -168,25 +170,42 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: str,
     clip_grad: float = 1.0,
+    grad_accum: int = 1,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ) -> Dict[str, float]:
     model.train()
     total_losses: Dict[str, float] = defaultdict(float)
     num_batches = 0
+    optimizer.zero_grad()
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         image = batch["image"].to(device)
         mask = batch["mask"].to(device)
         boxes = batch["box_prompt"].to(device)
         class_label = batch["class_label"].to(device)
 
-        optimizer.zero_grad()
-        mask_logits, class_logits = model(image, boxes=boxes)
-        total, losses = criterion(mask_logits, class_logits, mask, class_label)
-        total.backward()
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                mask_logits, class_logits = model(image, boxes=boxes)
+                total, losses = criterion(mask_logits, class_logits, mask, class_label)
+            scaler.scale(total).backward()
+        else:
+            mask_logits, class_logits = model(image, boxes=boxes)
+            total, losses = criterion(mask_logits, class_logits, mask, class_label)
+            total.backward()
 
-        if clip_grad > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-        optimizer.step()
+        if (batch_idx + 1) % grad_accum == 0:
+            if scaler is not None:
+                if clip_grad > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                optimizer.step()
+            optimizer.zero_grad()
 
         for k, v in losses.items():
             total_losses[k] += v.item()
@@ -300,8 +319,15 @@ def _build_optimizer(
 
 
 def main(args):
+    # TF32 on Ampere — ~30 % faster matmuls, no accuracy loss for training
+    torch.set_float32_matmul_precision("medium")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("Device: %s", device)
+    if device == "cuda":
+        props = torch.cuda.get_device_properties(0)
+        logger.info("GPU: %s  VRAM: %.1f GB", torch.cuda.get_device_name(0),
+                     props.total_memory / 1024**3)
 
     # ── Data ──────────────────────────────────────────────────────
     logger.info("Loading datasets ...")
@@ -314,7 +340,7 @@ def main(args):
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=0,
-        pin_memory=(device == "cuda"),
+        pin_memory=False,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -341,6 +367,15 @@ def main(args):
         lambda_mask=args.lambda_mask, lambda_class=args.lambda_class,
     )
 
+    # ── AMP ───────────────────────────────────────────────────────
+    scaler = None
+    if args.amp and device == "cuda":
+        scaler = torch.cuda.amp.GradScaler()
+        logger.info("AMP: ON  |  grad_accum: %d  |  effective batch: %d",
+                     args.grad_accum, args.batch_size * args.grad_accum)
+    else:
+        logger.info("AMP: OFF  |  grad_accum: %d", args.grad_accum)
+
     # ── Training loop ─────────────────────────────────────────────
     best_val_loss = float("inf")
     start_epoch = 0
@@ -357,7 +392,8 @@ def main(args):
         t0 = time.perf_counter()
 
         train_losses = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, args.clip_grad,
+            model, train_loader, criterion, optimizer, device,
+            args.clip_grad, args.grad_accum, scaler,
         )
         val_losses = validate(model, val_loader, criterion, device)
 
@@ -377,6 +413,11 @@ def main(args):
             best_val_loss = val_losses["loss"]
             save_checkpoint(model, optimizer, epoch, best_val_loss, args.save_path)
 
+        # Aggressive cleanup for 6 GB VRAM
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
     logger.info("Done.  Best val_loss: %.4f  Checkpoint: %s", best_val_loss, args.save_path)
 
 
@@ -390,14 +431,19 @@ def _parse_args(argv=None):
     )
     parser.add_argument("--checkpoint", default="sam_vit_b_01ec64.pth",
                         help="Path to SAM ViT-B checkpoint")
-    parser.add_argument("--root-dir", default="G:/Dataset",
+    parser.add_argument("--root-dir", default="D:/Dataset",
                         help="Root directory containing all dataset folders")
     parser.add_argument("--save-path", default="best_model.pth",
                         help="Path to save the best checkpoint")
     parser.add_argument("--resume", default=None,
                         help="Resume from checkpoint path")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Per-GPU batch size (6 GB VRAM -> 1)")
+    parser.add_argument("--grad-accum", type=int, default=4,
+                        help="Gradient accumulation steps")
+    parser.add_argument("--amp", action="store_true", default=True,
+                        help="Enable AMP (mixed precision)")
     parser.add_argument("--lr-adapter", type=float, default=1e-4)
     parser.add_argument("--lr-head", type=float, default=1e-3)
     parser.add_argument("--lr-other", type=float, default=1e-4)

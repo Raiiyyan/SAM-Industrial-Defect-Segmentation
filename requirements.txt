@@ -1,3 +1,12 @@
+# Cross-platform requirements for SAM-Industrial-Defect-Segmentation.
+#
+# Install with the index URL matching your GPU:
+#   Laptop (RTX 3050 / Ampere, CUDA 12.4):
+#     pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124
+#
+#   Desktop (RTX 5060 Ti / Blackwell, CUDA 12.8 nightly):
+#     pip install -r requirements.txt --index-url https://download.pytorch.org/whl/nightly/cu128
+#
 torch>=2.0.0
 torchvision>=0.15.0
 opencv-python>=4.8.0
