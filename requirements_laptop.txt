@@ -1,0 +1,8 @@
+# Laptop edition -- stable PyTorch for RTX 3050 (Ampere sm_86, 6 GB VRAM)
+# Install with:  pip install -r requirements_laptop.txt --index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+opencv-python>=4.8.0
+pillow>=10.0.0
+numpy>=1.24.0
+segment-anything>=1.0
