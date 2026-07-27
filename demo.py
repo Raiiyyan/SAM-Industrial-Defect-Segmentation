@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from segment_anything import sam_model_registry, SamPredictor
 
-# Configuration
+# address
 SAM_CHECKPOINT = "sam_vit_b_01ec64.pth" 
 MODEL_TYPE = "vit_b"
 IMAGE_PATH = "bottle/test/broken_large/000.png" 
@@ -24,7 +24,7 @@ predictor.set_image(real_image)
 
 # Predict defect bounding area using automated center coordinates
 h, w, _ = real_image.shape
-input_box = np.array([int(w*0.1), int(h*0.1), int(w*0.9), int(h*0.9)]) 
+input_box = np.array([int(w*0.1), int(h*0.1), int(w*0.9), int(h*0.9)]) #Prompting er jonno(wish)
 
 print("Running inference baseline...")
 masks, _, _ = predictor.predict(box=input_box, multimask_output=False)
