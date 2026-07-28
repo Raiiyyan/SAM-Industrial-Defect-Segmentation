@@ -38,6 +38,8 @@ class JointMaskClassLoss(nn.Module):
     lambda_class : float  Weight for the class loss (default 0.5).
     dice_weight : float  Weight of Dice within the mask loss (default 0.5).
     bce_weight : float  Weight of BCE within the mask loss (default 0.5).
+    class_weights : Tensor or None  Per-class weights for CrossEntropyLoss.
+        If None, uses inverse-frequency weights to handle class imbalance.
 
     Returns
     -------
@@ -51,6 +53,7 @@ class JointMaskClassLoss(nn.Module):
         lambda_class: float = 0.5,
         dice_weight: float = 0.5,
         bce_weight: float = 0.5,
+        class_weights: torch.Tensor = None,
     ):
         super().__init__()
         self.lambda_mask = lambda_mask
@@ -59,7 +62,12 @@ class JointMaskClassLoss(nn.Module):
         self.bce_weight = bce_weight
         self.dice = DiceLoss()
         self.bce = nn.BCEWithLogitsLoss()
-        self.ce = nn.CrossEntropyLoss()
+        # Inverse-frequency weights to handle class imbalance
+        if class_weights is None:
+            # Based on observed distribution: 0:0, 1:67, 2:143, 3:14, 4:20, 5:0, 6:27, 7:329
+            weights = torch.tensor([1.0, 3.0, 1.5, 8.0, 6.0, 1.0, 5.0, 0.5])
+            class_weights = weights / weights.sum() * len(weights)  # normalize
+        self.ce = nn.CrossEntropyLoss(weight=class_weights)
 
     def forward(
         self,
