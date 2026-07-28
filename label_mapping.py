@@ -60,9 +60,7 @@ _SEVERSTAL_MAP: Dict[int, int] = {
 # All are essentially a "geometric deformation" of the surface pattern.
 # REVIEW: if your DAGM classes have distinguishable defect semantics,
 # override individual entries here.
-_DAGM_MAP: Dict[int, int] = {
-    i: 7 for i in range(10)  # all → Geometric Deformation
-}
+_DAGM_MAP: Dict[int, int] = {i: 7 for i in range(10)}  # all → Geometric Deformation
 
 # ── DefectSpectrum ──────────────────────────────────────────────
 # Currently binary (0 = defect).  Without finer-grained labels we
@@ -207,6 +205,7 @@ def map_dataset_item(item: dict) -> dict:
 
 
 # ── Smoke test ──────────────────────────────────────────────────
+
 
 def _smoke_test():
     """Verify every dataset has a plausible mapping for at least one label."""

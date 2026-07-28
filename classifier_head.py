@@ -53,8 +53,9 @@ class DefectClassifierHead(nn.Module):
         Dropout probability (default 0.3).
     """
 
-    def __init__(self, input_dim: int = 256, num_classes: int = NUM_CLASSES,
-                 dropout: float = 0.3):
+    def __init__(
+        self, input_dim: int = 256, num_classes: int = NUM_CLASSES, dropout: float = 0.3
+    ):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, 128)
         self.dropout = nn.Dropout(dropout)

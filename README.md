@@ -70,8 +70,8 @@ ds = UniversalIndustrialDataset(
     split="train",
 )
 item = ds[0]
-# item["image"]         : (3, 1024, 1024) float32  ImageNet-normalized
-# item["mask"]          : (1, 1024, 1024) float32  binary
+# item["image"]         : (3, 512, 512) float32  ImageNet-normalized
+# item["mask"]          : (1, 512, 512) float32  binary
 # item["box_prompt"]    : (4,) int64               [x1,y1,x2,y2]
 # item["class_label"]   : int                      per-dataset label
 # item["source_dataset"]: str
@@ -89,7 +89,7 @@ item = map_dataset_item(item)
 ## Architecture
 
 ```
-Image (B, 3, 1024, 1024)
+Image (B, 3, 512, 512)
   |
   v
 SAM ViT-B Image Encoder -- (frozen, 24 injected IndustrialAdapters)
@@ -99,7 +99,7 @@ Prompt Encoder  (box prompt from mask)
   |
   v
 Mask Decoder (TwoWayTransformer)
-  +--> mask_logits (B, 1, 256, 256)
+  +--> mask_logits (B, 1, 128, 128)
   |
   +--> IoU token --> DefectClassifierHead --> class_logits (B, 8)
 ```
@@ -137,7 +137,7 @@ pip install -r requirements.txt --index-url https://download.pytorch.org/whl/nig
 python train.py --checkpoint sam_vit_b_01ec64.pth --root-dir D:/Dataset
 ```
 
-Default settings (work on both 6 GB and 16 GB): batch-size=1, grad-accum=4, AMP on, TF32 enabled.
+Default settings (work on both 6 GB and 16 GB): batch-size=1, grad-accum=8, AMP on, TF32 enabled.
 
 ## Run tests
 
@@ -159,7 +159,7 @@ Prints 6 sections: datasets, label mapping, model architecture, inference, train
 
 ## Notes
 
-- All images are **letterboxed** to 1024x1024 (aspect ratio preserved, zero-padded), not stretched.
+- All images are **letterboxed** to 512x512 (aspect ratio preserved, zero-padded), not stretched.
 - DAGM2007 masks are **coarse elliptical labels**, not pixel-precise ground truth.
 - NEU-DET masks are **bounding-box derived**, not pixel-precise.
 - Severstal and MVTec AD 2 use **custom 70/15/15 stratified splits** (no public test labels).

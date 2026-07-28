@@ -1,0 +1,8 @@
+Overall mIoU,0.5245
+Overall Dice,0.6540
+Overall Accuracy,0.3000
+Macro F1,0.1017
+
+mvtec_ad/mIoU,0.5245
+mvtec_ad/Dice,0.6540
+mvtec_ad/n,50

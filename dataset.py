@@ -9,8 +9,11 @@ Supported datasets (all paths configurable via root_dir):
   - DAGM2007          (elliptical region labels in _label.PNG files)
   - DefectSpectrum    (PNG masks in image/mask sub-folder structure)
 
-All images are resized to TARGET_SIZE (default 1024x1024) with letterboxing
+All images are resized to TARGET_SIZE (default 512x512) with letterboxing
 (preserve aspect ratio, pad with zeros).  Masks are handled analogously.
+
+Use precompute_cache() to load all data into RAM before training — critical
+for GPU utilization.
 """
 
 import os
@@ -32,15 +35,21 @@ logger = logging.getLogger("UniversalIndustrialDataset")
 # Constants
 # ---------------------------------------------------------------------------
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-TARGET_SIZE   = (1024, 1024)  # (W, H)
+IMAGENET_STD = [0.229, 0.224, 0.225]
+TARGET_SIZE = (
+    512,
+    512,
+)  # (W, H) — 512px for training; SAM pos_embed will be interpolated
 
 
 # ===================================================================
 # 1. PARSER FUNCTIONS  (individually testable)
 # ===================================================================
 
-def parse_png_mask(path: str, target_size: Tuple[int, int] = TARGET_SIZE) -> torch.Tensor:
+
+def parse_png_mask(
+    path: str, target_size: Tuple[int, int] = TARGET_SIZE
+) -> torch.Tensor:
     """Read a binary PNG mask and return a float tensor.
 
     Input format
@@ -72,8 +81,9 @@ def parse_png_mask(path: str, target_size: Tuple[int, int] = TARGET_SIZE) -> tor
     return torch.from_numpy(mask).unsqueeze(0).float()
 
 
-def parse_rle_mask(rle_string: str, height: int, width: int,
-                   target_size: Tuple[int, int] = TARGET_SIZE) -> torch.Tensor:
+def parse_rle_mask(
+    rle_string: str, height: int, width: int, target_size: Tuple[int, int] = TARGET_SIZE
+) -> torch.Tensor:
     """Decode a Severstal-format Run-Length Encoding string into a binary mask.
 
     Input format
@@ -106,9 +116,9 @@ def parse_rle_mask(rle_string: str, height: int, width: int,
         if len(parts) % 2 != 0:
             raise ValueError(f"RLE has odd number of tokens ({len(parts)})")
         for i in range(0, len(parts), 2):
-            start = parts[i] - 1   # convert to 0-indexed
+            start = parts[i] - 1  # convert to 0-indexed
             length = parts[i + 1]
-            mask[start:start + length] = 1
+            mask[start : start + length] = 1
     except Exception as exc:
         raise ValueError(
             f"[parse_rle_mask] Malformed RLE string ({exc}): {rle_string[:200]}..."
@@ -119,8 +129,9 @@ def parse_rle_mask(rle_string: str, height: int, width: int,
     return torch.from_numpy(mask).unsqueeze(0).float()
 
 
-def parse_ellipse_mask(label_path: str,
-                       target_size: Tuple[int, int] = TARGET_SIZE) -> torch.Tensor:
+def parse_ellipse_mask(
+    label_path: str, target_size: Tuple[int, int] = TARGET_SIZE
+) -> torch.Tensor:
     """Parse a DAGM2007 _label.PNG into a binary mask.
 
     NOTE
@@ -149,7 +160,9 @@ def parse_ellipse_mask(label_path: str,
     torch.Tensor  shape (1, H, W), float32, values in {0.0, 1.0}.
     """
     if not os.path.isfile(label_path):
-        raise FileNotFoundError(f"[parse_ellipse_mask] Label file not found: {label_path}")
+        raise FileNotFoundError(
+            f"[parse_ellipse_mask] Label file not found: {label_path}"
+        )
 
     mask = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
@@ -160,9 +173,12 @@ def parse_ellipse_mask(label_path: str,
     return torch.from_numpy(mask).unsqueeze(0).float()
 
 
-def parse_bbox_mask(bbox: Tuple[int, int, int, int],
-                    height: int, width: int,
-                    target_size: Tuple[int, int] = TARGET_SIZE) -> torch.Tensor:
+def parse_bbox_mask(
+    bbox: Tuple[int, int, int, int],
+    height: int,
+    width: int,
+    target_size: Tuple[int, int] = TARGET_SIZE,
+) -> torch.Tensor:
     """Convert a bounding box to a binary mask.
 
     NOTE
@@ -192,7 +208,7 @@ def parse_bbox_mask(bbox: Tuple[int, int, int, int],
     y2 = min(height - 1, y2)
 
     mask = np.zeros((height, width), dtype=np.uint8)
-    mask[y1:y2 + 1, x1:x2 + 1] = 1
+    mask[y1 : y2 + 1, x1 : x2 + 1] = 1
 
     mask = _letterbox(mask, target_size, interpolation=cv2.INTER_NEAREST)
     return torch.from_numpy(mask).unsqueeze(0).float()
@@ -202,8 +218,10 @@ def parse_bbox_mask(bbox: Tuple[int, int, int, int],
 # 1b. HELPER: letterbox resize
 # ===================================================================
 
-def _letterbox(arr: np.ndarray, target_size: Tuple[int, int],
-               interpolation: int = cv2.INTER_LINEAR) -> np.ndarray:
+
+def _letterbox(
+    arr: np.ndarray, target_size: Tuple[int, int], interpolation: int = cv2.INTER_LINEAR
+) -> np.ndarray:
     """Resize *arr* to *target_size* while preserving aspect ratio (letterbox).
 
     Parameters
@@ -240,12 +258,12 @@ def _letterbox(arr: np.ndarray, target_size: Tuple[int, int],
         canvas = np.zeros((target_h, target_w), dtype=arr.dtype)
         y_off = (target_h - new_h) // 2
         x_off = (target_w - new_w) // 2
-        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        canvas[y_off : y_off + new_h, x_off : x_off + new_w] = resized
     else:
         canvas = np.zeros((target_h, target_w, arr.shape[2]), dtype=arr.dtype)
         y_off = (target_h - new_h) // 2
         x_off = (target_w - new_w) // 2
-        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        canvas[y_off : y_off + new_h, x_off : x_off + new_w] = resized
 
     return canvas
 
@@ -253,6 +271,7 @@ def _letterbox(arr: np.ndarray, target_size: Tuple[int, int],
 # ===================================================================
 # 2. BOX PROMPT GENERATION
 # ===================================================================
+
 
 def generate_box_prompt(mask: torch.Tensor, padding: float = 0.1) -> torch.Tensor:
     """Generate a bounding-box prompt from a binary ground-truth mask.
@@ -300,6 +319,7 @@ def generate_box_prompt(mask: torch.Tensor, padding: float = 0.1) -> torch.Tenso
 
 _SAMPLE_KEYS = ["image_path", "mask_path", "class_label", "meta"]  # meta is a dict
 
+
 def build_splits(
     samples: List[dict],
     dataset_name: str,
@@ -329,8 +349,9 @@ def build_splits(
     -------
     train_samples, val_samples, test_samples
     """
-    assert abs((train_ratio + val_ratio + test_ratio) - 1.0) < 1e-6, \
-        "Ratios must sum to 1.0"
+    assert (
+        abs((train_ratio + val_ratio + test_ratio) - 1.0) < 1e-6
+    ), "Ratios must sum to 1.0"
 
     rng = np.random.default_rng(seed=42)  # deterministic across runs
 
@@ -344,35 +365,41 @@ def build_splits(
             rng.shuffle(cls_indices)
             n = len(cls_indices)
             n_train = max(1, int(round(n * train_ratio)))
-            n_val   = max(1, int(round(n * val_ratio)))
+            n_val = max(1, int(round(n * val_ratio)))
             # Ensure we don't exceed available samples
             if n_train + n_val > n:
                 n_train = n - n_val if n > n_val else n
                 n_val = 0
-            n_test  = n - n_train - n_val
+            n_test = n - n_train - n_val
 
             train_idx.extend(cls_indices[:n_train].tolist())
-            val_idx.extend(cls_indices[n_train:n_train + n_val].tolist())
-            test_idx.extend(cls_indices[n_train + n_val:].tolist())
+            val_idx.extend(cls_indices[n_train : n_train + n_val].tolist())
+            test_idx.extend(cls_indices[n_train + n_val :].tolist())
 
         train_s = [samples[i] for i in train_idx]
-        val_s   = [samples[i] for i in val_idx]
-        test_s  = [samples[i] for i in test_idx]
+        val_s = [samples[i] for i in val_idx]
+        test_s = [samples[i] for i in test_idx]
     else:
         idx = list(range(len(samples)))
         rng.shuffle(idx)
         n = len(samples)
         n_train = int(round(n * train_ratio))
-        n_val   = int(round(n * val_ratio))
+        n_val = int(round(n * val_ratio))
         train_s = [samples[i] for i in idx[:n_train]]
-        val_s   = [samples[i] for i in idx[n_train:n_train + n_val]]
-        test_s  = [samples[i] for i in idx[n_train + n_val:]]
+        val_s = [samples[i] for i in idx[n_train : n_train + n_val]]
+        test_s = [samples[i] for i in idx[n_train + n_val :]]
 
     logger.info(
         "build_splits | %s | stratify=%s | train=%d val=%d test=%d "
         "(ratios %.2f/%.2f/%.2f)",
-        dataset_name, stratify, len(train_s), len(val_s), len(test_s),
-        train_ratio, val_ratio, test_ratio,
+        dataset_name,
+        stratify,
+        len(train_s),
+        len(val_s),
+        len(test_s),
+        train_ratio,
+        val_ratio,
+        test_ratio,
     )
     return train_s, val_s, test_s
 
@@ -426,6 +453,7 @@ class UniversalIndustrialDataset(Dataset):
         split: str = "train",
         target_size: Tuple[int, int] = TARGET_SIZE,
         transform: Optional[Callable] = None,
+        use_cache: bool = False,
     ):
         if dataset_name not in SUPPORTED_DATASETS:
             raise ValueError(
@@ -436,9 +464,10 @@ class UniversalIndustrialDataset(Dataset):
         self.split = split
         self.target_size = target_size
         self.transform = transform
+        self.use_cache = use_cache
 
         # Path shortcuts
-        self._path = lambda *p: os.path.join(root_dir, *p)
+        self._root_dir = root_dir
 
         # Build sample list
         loader = getattr(self, f"_load_{dataset_name}")
@@ -448,17 +477,40 @@ class UniversalIndustrialDataset(Dataset):
         if len(self.samples) == 0:
             logger.warning(
                 "UniversalIndustrialDataset(%s, %s) — 0 samples!",
-                dataset_name, split,
+                dataset_name,
+                split,
             )
 
         # ImageNet normalisation (applied after letterbox)
-        self.normalize = transforms.Normalize(
-            mean=IMAGENET_MEAN, std=IMAGENET_STD
-        )
+        self.normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         self.to_tensor = transforms.ToTensor()  # HWC uint8 → CHW float [0,1]
+
+        # Precomputed cache (populated by precompute_cache())
+        self._image_cache: Optional[Dict[int, torch.Tensor]] = None
+        self._mask_cache: Optional[Dict[int, torch.Tensor]] = None
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def precompute_cache(self):
+        """Load all images and masks into RAM so __getitem__ is instant.
+
+        Call this BEFORE creating the DataLoader.  Eliminates disk I/O
+        during training — critical for GPU utilization on small VRAM cards.
+        """
+        self._image_cache = {}
+        self._mask_cache = {}
+        for i in range(len(self.samples)):
+            sample = self.samples[i]
+            self._image_cache[i] = self._load_image(sample["image_path"])
+            self._mask_cache[i] = self._load_mask(sample)
+        self.use_cache = True
+        logger.info(
+            "Cached %d images + masks for %s/%s",
+            len(self.samples),
+            self.dataset_name,
+            self.split,
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Return a dict with keys:
@@ -471,8 +523,12 @@ class UniversalIndustrialDataset(Dataset):
         - ``meta``          : dict      sample metadata (used for label mapping).
         """
         sample = self.samples[idx]
-        img = self._load_image(sample["image_path"])
-        mask = self._load_mask(sample)
+        if self.use_cache and self._image_cache is not None:
+            img = self._image_cache[idx]
+            mask = self._mask_cache[idx]
+        else:
+            img = self._load_image(sample["image_path"])
+            mask = self._load_mask(sample)
         box = generate_box_prompt(mask, padding=0.10)
 
         return {
@@ -497,8 +553,8 @@ class UniversalIndustrialDataset(Dataset):
         # Letterbox to target size
         img_rz = _letterbox(img_rgb, self.target_size, interpolation=cv2.INTER_LINEAR)
         # Normalise
-        tensor = self.to_tensor(img_rz)        # [0, 1] float32
-        tensor = self.normalize(tensor)         # ImageNet stats
+        tensor = self.to_tensor(img_rz)  # [0, 1] float32
+        tensor = self.normalize(tensor)  # ImageNet stats
         if self.transform is not None:
             tensor = self.transform(tensor)
         return tensor
@@ -545,13 +601,12 @@ class UniversalIndustrialDataset(Dataset):
     # ── MVTec AD ──────────────────────────────────────────────────────
 
     def _load_mvtec_ad(self) -> List[dict]:
-        base = self._path("MVTec AD")
+        base = os.path.join(self._root_dir, "MVTec AD")
         samples = []
 
-        categories = sorted([
-            d for d in os.listdir(base)
-            if os.path.isdir(os.path.join(base, d))
-        ])
+        categories = sorted(
+            [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
+        )
 
         for cat_idx, cat in enumerate(categories):
             gt_dir = os.path.join(base, cat, "ground_truth")
@@ -559,10 +614,13 @@ class UniversalIndustrialDataset(Dataset):
             if not os.path.isdir(gt_dir) or not os.path.isdir(test_dir):
                 continue
 
-            defect_types = sorted([
-                d for d in os.listdir(test_dir)
-                if os.path.isdir(os.path.join(test_dir, d)) and d != "good"
-            ])
+            defect_types = sorted(
+                [
+                    d
+                    for d in os.listdir(test_dir)
+                    if os.path.isdir(os.path.join(test_dir, d)) and d != "good"
+                ]
+            )
 
             for defect in defect_types:
                 img_folder = os.path.join(test_dir, defect)
@@ -582,47 +640,60 @@ class UniversalIndustrialDataset(Dataset):
                     mask_name = f"{base_name}_mask.png"
                     mask_path = os.path.join(mask_folder, mask_name)
                     if not os.path.isfile(mask_path):
-                        logger.warning(
-                            "MVTec AD | mask missing: %s", mask_path
-                        )
+                        logger.warning("MVTec AD | mask missing: %s", mask_path)
                         continue
-                    samples.append({
-                        "image_path": img_path,
-                        "mask_path": mask_path,
-                        "class_label": cat_idx,
-                        "meta": {"category": cat, "defect": defect},
-                        "split": "test",  # all labeled data is in the test set
-                    })
+                    samples.append(
+                        {
+                            "image_path": img_path,
+                            "mask_path": mask_path,
+                            "class_label": cat_idx,
+                            "meta": {"category": cat, "defect": defect},
+                            "split": "test",  # all labeled data is in the test set
+                        }
+                    )
 
         # Since MVTec AD is unsupervised by design, we use its test set as labeled
         # data and split it into train/val/test for supervised fine-tuning.
         train, val, test = build_splits(
-            samples, "mvtec_ad", stratify=True,
+            samples,
+            "mvtec_ad",
+            stratify=True,
         )
-        for s in train: s["split"] = "train"
-        for s in val:   s["split"] = "val"
-        for s in test:  s["split"] = "test"
+        for s in train:
+            s["split"] = "train"
+        for s in val:
+            s["split"] = "val"
+        for s in test:
+            s["split"] = "test"
         logger.info(
             "MVTec AD | %d categories, %d labeled samples -> split into "
             "train=%d val=%d test=%d",
-            len(categories), len(samples), len(train), len(val), len(test),
+            len(categories),
+            len(samples),
+            len(train),
+            len(val),
+            len(test),
         )
         return samples
 
     # ── MVTec AD 2 ────────────────────────────────────────────────────
 
     def _load_mvtec_ad_2(self) -> List[dict]:
-        base = self._path("mvtec_ad_2")
+        base = os.path.join(self._root_dir, "mvtec_ad_2")
         samples = []
 
-        categories = sorted([
-            d for d in os.listdir(base)
-            if os.path.isdir(os.path.join(base, d)) and d not in ("license.txt", "readme.txt")
-        ])
+        categories = sorted(
+            [
+                d
+                for d in os.listdir(base)
+                if os.path.isdir(os.path.join(base, d))
+                and d not in ("license.txt", "readme.txt")
+            ]
+        )
 
         for cat_idx, cat in enumerate(categories):
             test_bad = os.path.join(base, cat, "test_public", "bad")
-            gt_dir   = os.path.join(base, cat, "test_public", "ground_truth", "bad")
+            gt_dir = os.path.join(base, cat, "test_public", "ground_truth", "bad")
             if not os.path.isdir(test_bad) or not os.path.isdir(gt_dir):
                 logger.warning(
                     "MVTec AD 2 | %s — test_public/bad or ground_truth missing", cat
@@ -637,42 +708,53 @@ class UniversalIndustrialDataset(Dataset):
                 mask_name = f"{base_name}_mask.png"
                 mask_path = os.path.join(gt_dir, mask_name)
                 if not os.path.isfile(mask_path):
-                    logger.warning(
-                        "MVTec AD 2 | mask missing for %s/%s", cat, fname
-                    )
+                    logger.warning("MVTec AD 2 | mask missing for %s/%s", cat, fname)
                     continue
 
                 # Extract defect type from filename: "{idx}_{defect_type}.png"
-                defect_type = base_name.split("_", 1)[1] if "_" in base_name else "unknown"
+                defect_type = (
+                    base_name.split("_", 1)[1] if "_" in base_name else "unknown"
+                )
 
-                samples.append({
-                    "image_path": img_path,
-                    "mask_path": mask_path,
-                    "class_label": cat_idx,
-                    "meta": {"category": cat, "defect": defect_type},
-                    "split": None,  # will be assigned by build_splits
-                })
+                samples.append(
+                    {
+                        "image_path": img_path,
+                        "mask_path": mask_path,
+                        "class_label": cat_idx,
+                        "meta": {"category": cat, "defect": defect_type},
+                        "split": None,  # will be assigned by build_splits
+                    }
+                )
 
         # Custom split: only test_public/bad has public labels
         train, val, test = build_splits(
-            samples, "mvtec_ad_2", stratify=True,
+            samples,
+            "mvtec_ad_2",
+            stratify=True,
         )
-        for s in train: s["split"] = "train"
-        for s in val:   s["split"] = "val"
-        for s in test:  s["split"] = "test"
+        for s in train:
+            s["split"] = "train"
+        for s in val:
+            s["split"] = "val"
+        for s in test:
+            s["split"] = "test"
         logger.info(
             "MVTec AD 2 | %d categories, %d labeled samples -> split into "
             "train=%d val=%d test=%d",
-            len(categories), len(samples), len(train), len(val), len(test),
+            len(categories),
+            len(samples),
+            len(train),
+            len(val),
+            len(test),
         )
         return samples
 
     # ── Severstal Steel Defect ────────────────────────────────────────
 
     def _load_severstal(self) -> List[dict]:
-        base = self._path("severstal-steel-defect-detection")
+        base = os.path.join(self._root_dir, "severstal-steel-defect-detection")
         csv_path = os.path.join(base, "train.csv")
-        img_dir  = os.path.join(base, "train_images")
+        img_dir = os.path.join(base, "train_images")
 
         if not os.path.isfile(csv_path):
             raise FileNotFoundError(f"Severstal CSV not found: {csv_path}")
@@ -716,54 +798,68 @@ class UniversalIndustrialDataset(Dataset):
                 if not rle:
                     continue
                 any_defect = True
-                samples.append({
-                    "image_path": img_path,
-                    "mask_path": None,
-                    "class_label": cls_id - 1,  # 0-indexed
-                    "meta": {
-                        "rle": rle,
-                        "img_h": img_h,
-                        "img_w": img_w,
-                        "class_id": cls_id,
-                    },
-                    "split": None,
-                })
+                samples.append(
+                    {
+                        "image_path": img_path,
+                        "mask_path": None,
+                        "class_label": cls_id - 1,  # 0-indexed
+                        "meta": {
+                            "rle": rle,
+                            "img_h": img_h,
+                            "img_w": img_w,
+                            "class_id": cls_id,
+                        },
+                        "split": None,
+                    }
+                )
 
             if not any_defect:
                 # Image with no defects — include as negative sample
-                samples.append({
-                    "image_path": img_path,
-                    "mask_path": None,
-                    "class_label": 4,  # placeholder (avoids collision with Class 1)
-                    "meta": {
-                        "rle": "",
-                        "img_h": img_h,
-                        "img_w": img_w,
-                        "class_id": 0,
-                    },
-                    "split": None,
-                })
+                samples.append(
+                    {
+                        "image_path": img_path,
+                        "mask_path": None,
+                        "class_label": 4,  # placeholder (avoids collision with Class 1)
+                        "meta": {
+                            "rle": "",
+                            "img_h": img_h,
+                            "img_w": img_w,
+                            "class_id": 0,
+                        },
+                        "split": None,
+                    }
+                )
 
         # Custom split (no public test labels)
         train, val, test = build_splits(samples, "severstal", stratify=True)
-        for s in train: s["split"] = "train"
-        for s in val:   s["split"] = "val"
-        for s in test:  s["split"] = "test"
+        for s in train:
+            s["split"] = "train"
+        for s in val:
+            s["split"] = "val"
+        for s in test:
+            s["split"] = "test"
         logger.info(
             "Severstal | %d samples -> train=%d val=%d test=%d",
-            len(samples), len(train), len(val), len(test),
+            len(samples),
+            len(train),
+            len(val),
+            len(test),
         )
         return samples
 
     # ── NEU Surface Defect ────────────────────────────────────────────
 
     def _load_neu_det(self) -> List[dict]:
-        base = self._path("NEU-DET")
+        base = os.path.join(self._root_dir, "NEU-DET")
         samples = []
 
         NEU_CLASS_MAP = {
-            "crazing": 0, "inclusion": 1, "patches": 2,
-            "pitted_surface": 3, "rolled-in_scale": 4, "scratches": 5,
+            "crazing": 0,
+            "inclusion": 1,
+            "patches": 2,
+            "pitted_surface": 3,
+            "rolled-in_scale": 4,
+            "scratches": 5,
         }
 
         for split_dir in ("train", "validation"):
@@ -795,25 +891,25 @@ class UniversalIndustrialDataset(Dataset):
                     int(bbox_el.find("ymax").text),
                 )
 
-                img_path = os.path.join(
-                    base, split_dir, "images", cls_name, filename
-                )
+                img_path = os.path.join(base, split_dir, "images", cls_name, filename)
                 if not os.path.isfile(img_path):
                     logger.warning("NEU-DET | image missing: %s", img_path)
                     continue
 
-                samples.append({
-                    "image_path": img_path,
-                    "mask_path": None,
-                    "class_label": NEU_CLASS_MAP[cls_name],
-                    "meta": {
-                        "bbox": bbox,
-                        "img_h": img_h,
-                        "img_w": img_w,
-                        "class_name": cls_name,
-                    },
-                    "split": "train" if split_dir == "train" else "val",
-                })
+                samples.append(
+                    {
+                        "image_path": img_path,
+                        "mask_path": None,
+                        "class_label": NEU_CLASS_MAP[cls_name],
+                        "meta": {
+                            "bbox": bbox,
+                            "img_h": img_h,
+                            "img_w": img_w,
+                            "class_name": cls_name,
+                        },
+                        "split": "train" if split_dir == "train" else "val",
+                    }
+                )
 
         # Use official train/val splits from folder structure
         logger.info(
@@ -825,7 +921,7 @@ class UniversalIndustrialDataset(Dataset):
     # ── DAGM2007 ──────────────────────────────────────────────────────
 
     def _load_dagm2007(self) -> List[dict]:
-        base = self._path("DAGM_KaggleUpload")
+        base = os.path.join(self._root_dir, "DAGM_KaggleUpload")
         samples = []
 
         for i in range(1, 11):
@@ -847,13 +943,15 @@ class UniversalIndustrialDataset(Dataset):
                     if not os.path.isfile(label_path):
                         # Train images without labels are defect-free — skip
                         continue
-                    samples.append({
-                        "image_path": img_path,
-                        "mask_path": label_path,
-                        "class_label": i - 1,
-                        "meta": {"class_name": cls_name},
-                        "split": "train",
-                    })
+                    samples.append(
+                        {
+                            "image_path": img_path,
+                            "mask_path": label_path,
+                            "class_label": i - 1,
+                            "meta": {"class_name": cls_name},
+                            "split": "train",
+                        }
+                    )
 
             # Test split
             test_img_dir = os.path.join(cls_dir, "Test")
@@ -867,13 +965,15 @@ class UniversalIndustrialDataset(Dataset):
                     label_path = os.path.join(test_label_dir, f"{base_name}_label.PNG")
                     if not os.path.isfile(label_path):
                         continue
-                    samples.append({
-                        "image_path": img_path,
-                        "mask_path": label_path,
-                        "class_label": i - 1,
-                        "meta": {"class_name": cls_name},
-                        "split": "test",
-                    })
+                    samples.append(
+                        {
+                            "image_path": img_path,
+                            "mask_path": label_path,
+                            "class_label": i - 1,
+                            "meta": {"class_name": cls_name},
+                            "split": "test",
+                        }
+                    )
 
         logger.info(
             "DAGM2007 | %d samples (using official Train/Test split)",
@@ -884,7 +984,7 @@ class UniversalIndustrialDataset(Dataset):
     # ── DefectSpectrum (Hug) ──────────────────────────────────────────
 
     def _load_defect_spectrum(self) -> List[dict]:
-        base = self._path("Hug")
+        base = os.path.join(self._root_dir, "Hug")
         samples = []
 
         # -- DS-MVTec sub-dataset --
@@ -892,7 +992,10 @@ class UniversalIndustrialDataset(Dataset):
         if os.path.isdir(ds_mvtec):
             for cat in sorted(os.listdir(ds_mvtec)):
                 cat_dir = os.path.join(ds_mvtec, cat)
-                if not os.path.isdir(cat_dir) or cat in ("DS-MVTec.md", "captions.xlsx"):
+                if not os.path.isdir(cat_dir) or cat in (
+                    "DS-MVTec.md",
+                    "captions.xlsx",
+                ):
                     continue
                 img_dir = os.path.join(cat_dir, "image")
                 mask_dir = os.path.join(cat_dir, "mask")
@@ -910,13 +1013,15 @@ class UniversalIndustrialDataset(Dataset):
                         mask_path = os.path.join(mask_dir, rel)
                         if not os.path.isfile(mask_path):
                             continue
-                        samples.append({
-                            "image_path": img_path,
-                            "mask_path": mask_path,
-                            "class_label": 0,  # binary defect
-                            "meta": {"sub_dataset": "DS-MVTec", "category": cat},
-                            "split": None,
-                        })
+                        samples.append(
+                            {
+                                "image_path": img_path,
+                                "mask_path": mask_path,
+                                "class_label": 0,  # binary defect
+                                "meta": {"sub_dataset": "DS-MVTec", "category": cat},
+                                "split": None,
+                            }
+                        )
 
         # -- DS-DAGM sub-dataset --
         ds_dagm = os.path.join(base, "DS-DAGM")
@@ -932,13 +1037,15 @@ class UniversalIndustrialDataset(Dataset):
                     mask_path = os.path.join(mask_dir, f"{base_name}_mask.png")
                     if not os.path.isfile(mask_path):
                         continue
-                    samples.append({
-                        "image_path": img_path,
-                        "mask_path": mask_path,
-                        "class_label": 0,
-                        "meta": {"sub_dataset": "DS-DAGM"},
-                        "split": None,
-                    })
+                    samples.append(
+                        {
+                            "image_path": img_path,
+                            "mask_path": mask_path,
+                            "class_label": 0,
+                            "meta": {"sub_dataset": "DS-DAGM"},
+                            "split": None,
+                        }
+                    )
 
         # -- DS-Cotton-Fabric sub-dataset --
         ds_cotton = os.path.join(base, "DS-Cotton-Fabric")
@@ -954,13 +1061,15 @@ class UniversalIndustrialDataset(Dataset):
                     mask_path = os.path.join(mask_dir, f"{base_name}_mask.png")
                     if not os.path.isfile(mask_path):
                         continue
-                    samples.append({
-                        "image_path": img_path,
-                        "mask_path": mask_path,
-                        "class_label": 0,
-                        "meta": {"sub_dataset": "DS-Cotton-Fabric"},
-                        "split": None,
-                    })
+                    samples.append(
+                        {
+                            "image_path": img_path,
+                            "mask_path": mask_path,
+                            "class_label": 0,
+                            "meta": {"sub_dataset": "DS-Cotton-Fabric"},
+                            "split": None,
+                        }
+                    )
 
         # -- DS-VISION sub-dataset --
         ds_vision = os.path.join(base, "DS-VISION")
@@ -981,20 +1090,25 @@ class UniversalIndustrialDataset(Dataset):
                         mask_path = os.path.join(mask_dir, f"{base_name}_mask.png")
                         if not os.path.isfile(mask_path):
                             continue
-                        samples.append({
-                            "image_path": img_path,
-                            "mask_path": mask_path,
-                            "class_label": 0,
-                            "meta": {"sub_dataset": "DS-VISION", "category": cat},
-                            "split": None,
-                        })
+                        samples.append(
+                            {
+                                "image_path": img_path,
+                                "mask_path": mask_path,
+                                "class_label": 0,
+                                "meta": {"sub_dataset": "DS-VISION", "category": cat},
+                                "split": None,
+                            }
+                        )
 
         # DefectSpectrum has no official splits — create custom splits
         if len(samples) > 0:
             train, val, test = build_splits(samples, "defect_spectrum", stratify=False)
-            for s in train: s["split"] = "train"
-            for s in val:   s["split"] = "val"
-            for s in test:  s["split"] = "test"
+            for s in train:
+                s["split"] = "train"
+            for s in val:
+                s["split"] = "val"
+            for s in test:
+                s["split"] = "test"
 
         logger.info(
             "DefectSpectrum | %d samples -> train=%d val=%d test=%d",
@@ -1013,6 +1127,7 @@ class UniversalIndustrialDataset(Dataset):
 # ===================================================================
 # 7. UNIT TESTS  (synthetic examples for every parser)
 # ===================================================================
+
 
 def _run_unit_tests():
     """Run synthetic tests for each parser function and generate_box_prompt.
@@ -1039,8 +1154,11 @@ def _run_unit_tests():
             self.assertEqual(result.dtype, torch.float32)
             self.assertTrue((result >= 0).all() and (result <= 1).all())
             # The defect region should survive letterboxing (non-zero somewhere)
-            self.assertGreater(result.sum().item(), 0,
-                               "parse_png_mask: defect region lost after resize")
+            self.assertGreater(
+                result.sum().item(),
+                0,
+                "parse_png_mask: defect region lost after resize",
+            )
 
         def test_parse_png_mask_all_zero(self):
             """All-zero mask (no defect)."""
@@ -1051,8 +1169,11 @@ def _run_unit_tests():
                 result = parse_png_mask(f.name, target_size=(1024, 1024))
             os.unlink(f.name)
             self.assertEqual(result.shape, (1, 1024, 1024))
-            self.assertEqual(result.sum().item(), 0,
-                             "parse_png_mask: all-zero mask should remain zero")
+            self.assertEqual(
+                result.sum().item(),
+                0,
+                "parse_png_mask: all-zero mask should remain zero",
+            )
 
         # ── parse_rle_mask ──────────────────────────────────────────
 
@@ -1176,7 +1297,7 @@ if __name__ == "__main__":
         format="%(levelname)s | %(name)s | %(message)s",
     )
 
-    ROOT = "G:/Dataset"
+    ROOT = "D:/Dataset"
 
     for ds_name in SUPPORTED_DATASETS:
         print(f"\n{'=' * 60}")
@@ -1201,6 +1322,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  ERROR: {e}")
             import traceback
+
             traceback.print_exc()
 
     print(f"\n{'=' * 60}")

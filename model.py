@@ -10,24 +10,26 @@ Architecture
                  →  IoU token (extracted via transformer forward hook)
 4. DefectClassifierHead (on IoU token)  →  class_logits (8 classes)
 
-The IoU token (``hs[:, 0, :]``) is the first of the five output tokens
-produced by the TwoWayTransformer.  It cross-attends to all image features,
-giving it a global representation of the detected object / defect.  SAM
-already uses this token to predict mask quality (IoU); we reuse it for
-classification, sharing the same computation with zero extra encoder cost.
+Training runs at 512x512 for memory efficiency.  Positional embeddings are
+interpolated from the pre-trained 1024x1024.  Use set_resolution() for inference.
 """
 
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from segment_anything import sam_model_registry
-from segment_anything.modeling.mask_decoder import MaskDecoder
 
 from adapters import IndustrialAdapter
 from classifier_head import DefectClassifierHead, CLASS_VOCAB, NUM_CLASSES
-from model_setup import (EMBED_DIM, BOTTLENECK_DIM, _ADAPTER_PREFIX,
-                         _make_patched_forward)
+from model_setup import (
+    EMBED_DIM,
+    BOTTLENECK_DIM,
+    _ADAPTER_PREFIX,
+    _make_patched_forward,
+)
 
 
 class IndustrialSAM(nn.Module):
@@ -41,6 +43,8 @@ class IndustrialSAM(nn.Module):
         Torch device string.
     bottleneck_dim : int
         Adapter bottleneck dimension (default 64).
+    train_resolution : int
+        Training resolution (default 512).
     """
 
     def __init__(
@@ -48,9 +52,11 @@ class IndustrialSAM(nn.Module):
         checkpoint_path: str,
         device: str = "cpu",
         bottleneck_dim: int = BOTTLENECK_DIM,
+        train_resolution: int = 512,
     ):
         super().__init__()
         self.device = device
+        self.train_resolution = train_resolution
 
         # ── Load SAM, freeze image encoder, inject adapters ──────
         sam = sam_model_registry["vit_b"](checkpoint=checkpoint_path)
@@ -68,6 +74,43 @@ class IndustrialSAM(nn.Module):
         self.image_encoder = sam.image_encoder
         self.prompt_encoder = sam.prompt_encoder
         self.mask_decoder = sam.mask_decoder
+
+        # ── Interpolate positional embeddings for training resolution ──
+        # SAM pos_embed shape: (1, H, W, C)  NOT (1, C, H, W)
+        patch_size = 16
+        new_spatial = train_resolution // patch_size
+
+        orig_pos_embed = self.image_encoder.pos_embed  # (1, 64, 64, 768)
+        new_pos_embed = F.interpolate(
+            orig_pos_embed.permute(0, 3, 1, 2),  # -> (1, 768, 64, 64)
+            size=(new_spatial, new_spatial),
+            mode="bicubic",
+            align_corners=False,
+        ).permute(
+            0, 2, 3, 1
+        )  # -> (1, 32, 32, 768)
+        self.image_encoder.pos_embed = nn.Parameter(new_pos_embed)
+
+        if hasattr(self.image_encoder, "rel_pos_h"):
+            self.image_encoder.rel_pos_h = nn.Parameter(
+                F.interpolate(
+                    self.image_encoder.rel_pos_h,
+                    size=(new_spatial, 1),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+            )
+            self.image_encoder.rel_pos_w = nn.Parameter(
+                F.interpolate(
+                    self.image_encoder.rel_pos_w,
+                    size=(1, new_spatial),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+            )
+
+        self.prompt_encoder.image_embedding_size = (new_spatial, new_spatial)
+        self.prompt_encoder.input_image_size = (train_resolution, train_resolution)
 
         # ── Register IoU token hook on the Transformer ────────────
         self._iou_token = None
@@ -89,6 +132,40 @@ class IndustrialSAM(nn.Module):
         # ── Move everything to target device ──────────────────────
         self.to(device)
 
+    def set_resolution(self, resolution: int):
+        """Switch to a different resolution (e.g. 1024 for inference)."""
+        patch_size = 16
+        new_spatial = resolution // patch_size
+
+        self.image_encoder.pos_embed = nn.Parameter(
+            F.interpolate(
+                self.image_encoder.pos_embed.permute(0, 3, 1, 2),
+                size=(new_spatial, new_spatial),
+                mode="bicubic",
+                align_corners=False,
+            ).permute(0, 2, 3, 1)
+        )
+        if hasattr(self.image_encoder, "rel_pos_h"):
+            self.image_encoder.rel_pos_h = nn.Parameter(
+                F.interpolate(
+                    self.image_encoder.rel_pos_h,
+                    size=(new_spatial, 1),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+            )
+            self.image_encoder.rel_pos_w = nn.Parameter(
+                F.interpolate(
+                    self.image_encoder.rel_pos_w,
+                    size=(1, new_spatial),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+            )
+        self.prompt_encoder.image_embedding_size = (new_spatial, new_spatial)
+        self.prompt_encoder.input_image_size = (resolution, resolution)
+        self.train_resolution = resolution
+
     def forward(
         self,
         image: torch.Tensor,
@@ -98,40 +175,46 @@ class IndustrialSAM(nn.Module):
 
         Parameters
         ----------
-        image : torch.Tensor  (B, 3, 1024, 1024)
-            ImageNet-normalised input image (letterboxed).
+        image : torch.Tensor  (B, 3, H, W)
         boxes : torch.Tensor  (B, 4)  or None
-            Bounding-box prompts in pixel coordinates [x1, y1, x2, y2].
-            If None, a full-image box [0, 0, 1023, 1023] is used.
 
         Returns
         -------
-        mask_logits : torch.Tensor  (B, 1, 256, 256)
-            Raw mask logits (apply sigmoid for binary prediction).
-        class_logits : torch.Tensor  (B, 8)
-            Raw class logits (feed to CrossEntropyLoss, no softmax).
+        mask_logits : (B, 1, 256, 256)
+        class_logits : (B, 8)
         """
         B = image.shape[0]
 
         if boxes is None:
+            H, W = image.shape[2], image.shape[3]
             boxes = torch.tensor(
-                [[0, 0, 1023, 1023]], device=self.device
+                [[0, 0, W - 1, H - 1]],
+                device=self.device,
             ).repeat(B, 1)
 
-        # ── Image encoder (batched — handles full batch) ───────────
-        image_embeddings = self.image_encoder(image)  # (B, 256, 64, 64)
-        self.prompt_encoder.input_image_size = (1024, 1024)
+        # ── Image encoder — gradient checkpointing saves VRAM ─────
+        image_embeddings = checkpoint(
+            self.image_encoder,
+            image,
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
+
+        self.prompt_encoder.input_image_size = (image.shape[2], image.shape[3])
+        self.prompt_encoder._input_image_size = (image.shape[2], image.shape[3])
         image_pe = self.prompt_encoder.get_dense_pe()
 
         # ── Decoder loop (SAM's mask decoder assumes B=1) ─────────
         mask_logits_list, class_logits_list = [], []
 
         for i in range(B):
-            img_emb_i = image_embeddings[i:i + 1]
-            box_i = boxes[i:i + 1]
+            img_emb_i = image_embeddings[i : i + 1]
+            box_i = boxes[i : i + 1]
 
             sparse, dense = self.prompt_encoder(
-                points=None, boxes=box_i, masks=None,
+                points=None,
+                boxes=box_i,
+                masks=None,
             )
 
             mask_i, _ = self.mask_decoder(
@@ -142,61 +225,52 @@ class IndustrialSAM(nn.Module):
                 multimask_output=False,
             )
 
-            iou_token = self._iou_token  # captured by transformer hook
+            iou_token = self._iou_token
             class_i = self.classifier_head(iou_token)
 
             mask_logits_list.append(mask_i)
             class_logits_list.append(class_i)
 
-        return torch.cat(mask_logits_list, dim=0), torch.cat(class_logits_list, dim=0)
+        return (torch.cat(mask_logits_list, dim=0), torch.cat(class_logits_list, dim=0))
 
     def get_trainable_params(self) -> list:
-        """Return list of parameters that should receive gradients.
-
-        Includes: adapter params (image encoder) + classifier head + any
-        other trainable components.
-        """
         return [p for p in self.parameters() if p.requires_grad]
 
 
 # ── Smoke test ──────────────────────────────────────────────────────
 
-def _run_smoke_test():
-    """Create IndustrialSAM with dummy data and print output shapes."""
-    import sys
-    ckpt = sys.argv[1] if len(sys.argv) > 1 else (
-        "G:/SAM-Industrial-Defect-Segmentation/sam_vit_b_01ec64.pth"
-    )
 
-    model = IndustrialSAM(ckpt, device="cpu")
+def _run_smoke_test():
+    import sys
+
+    ckpt = sys.argv[1] if len(sys.argv) > 1 else "sam_vit_b_01ec64.pth"
+
+    model = IndustrialSAM(ckpt, device="cpu", train_resolution=512)
     model.eval()
 
     B = 2
-    dummy_image = torch.randn(B, 3, 1024, 1024)
-    dummy_boxes = torch.tensor([
-        [100, 100, 500, 500],
-        [200, 200, 600, 600],
-    ], dtype=torch.float32)
+    dummy = torch.randn(B, 3, 512, 512)
+    boxes = torch.tensor(
+        [[50, 50, 250, 250], [100, 100, 300, 300]], dtype=torch.float32
+    )
 
     with torch.no_grad():
-        mask_logits, class_logits = model(dummy_image, boxes=dummy_boxes)
+        mask_logits, class_logits = model(dummy, boxes=boxes)
 
-    print(f"mask_logits shape:   {mask_logits.shape}   (expected (B, 1, 256, 256))")
-    print(f"class_logits shape:  {class_logits.shape}  (expected (B, 8))")
-    print(f"class_vocab:         {model.class_vocab}")
-    assert mask_logits.shape == (B, 1, 256, 256), f"mask shape mismatch: {mask_logits.shape}"
-    assert class_logits.shape == (B, 8), f"class shape mismatch: {class_logits.shape}"
-    print("\nSmoke test passed (all shapes correct).")
+    print(f"mask_logits:  {mask_logits.shape}  (expected (2, 1, 128, 128))")
+    print(f"class_logits: {class_logits.shape}  (expected (2, 8))")
+    assert mask_logits.shape == (2, 1, 128, 128)
+    assert class_logits.shape == (2, 8)
+    print("Smoke test OK (512x512).")
 
-    # Print adapter counts for verification
     adapter_params = sum(
         p.numel() for n, p in model.named_parameters() if _ADAPTER_PREFIX in n
     )
     head_params = sum(p.numel() for p in model.classifier_head.parameters())
     total_trainable = sum(p.numel() for p in model.get_trainable_params())
-    print(f"\nAdapter params:      {adapter_params:>8,}")
-    print(f"Classifier head:     {head_params:>8,}")
-    print(f"Total trainable:     {total_trainable:>8,}")
+    print(f"Adapter params:  {adapter_params:>10,}")
+    print(f"Classifier head: {head_params:>10,}")
+    print(f"Total trainable: {total_trainable:>10,}")
 
 
 if __name__ == "__main__":

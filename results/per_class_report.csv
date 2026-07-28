@@ -1,0 +1,9 @@
+class,name,precision,recall,f1,support
+0,Flawless,0.0000,0.0000,0.0000,0
+1,Surface Scratch,0.0000,0.0000,0.0000,4
+2,Structural Crack,0.5909,0.8125,0.6842,16
+3,Hole / Puncture,0.0000,0.0000,0.0000,4
+4,Inclusion,0.0714,0.6667,0.1290,3
+5,Missing Component,0.0000,0.0000,0.0000,0
+6,Discoloration / Stain,0.0000,0.0000,0.0000,2
+7,Geometric Deformation,0.0000,0.0000,0.0000,21

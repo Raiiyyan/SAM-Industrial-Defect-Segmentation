@@ -1,12 +1,14 @@
-"""Training pipeline for IndustrialSAM — joint mask + class prediction.
+"""
+Training loop for IndustrialSAM.
 
-Trains on all 6 industrial-defect datasets with a combined
-Dice + BCE (mask) and CrossEntropy (class) loss.
-Tuned for RTX 3050 6 GB laptop GPU (Ampere).
-
-Usage::
-
-    python train.py --checkpoint sam_vit_b_01ec64.pth --root-dir D:/Dataset
+Supports:
+  - Multi-dataset training (6 industrial defect datasets)
+  - AMP mixed precision (mandatory for 6 GB VRAM)
+  - Gradient accumulation (default 8 steps)
+  - Gradient checkpointing on encoder
+  - Cosine annealing LR scheduler
+  - Per-dataset loss logging and VRAM tracking
+  - Checkpoint save / resume (model + optimizer + scheduler)
 """
 
 import argparse
@@ -21,11 +23,14 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, ConcatDataset
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from dataset import UniversalIndustrialDataset, SUPPORTED_DATASETS
 from label_mapping import map_dataset_item
+from losses import DiceLoss, JointMaskClassLoss
 from model import IndustrialSAM
 from model_setup import _ADAPTER_PREFIX
+from optimizer_setup import build_optimizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,100 +40,20 @@ logging.basicConfig(
 logger = logging.getLogger("train")
 
 
-# ===================================================================
-# 1. LOSS FUNCTIONS
-# ===================================================================
-
-class DiceLoss(nn.Module):
-    """Sørensen–Dice coefficient loss for binary masks.
-
-    ``loss = 1 - (2 * |X ∩ Y| + smooth) / (|X| + |Y| + smooth)``
-    """
-
-    def __init__(self, smooth: float = 1e-6):
-        super().__init__()
-        self.smooth = smooth
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred = torch.sigmoid(pred)
-        pred = pred.flatten(1)
-        target = target.flatten(1)
-        intersection = (pred * target).sum(dim=1)
-        union = pred.sum(dim=1) + target.sum(dim=1)
-        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        return 1.0 - dice.mean()
-
-
-class JointMaskClassLoss(nn.Module):
-    """Combined mask (Dice + BCE) and class (CE) loss.
-
-    ``total = λ_mask * (α * Dice + β * BCE) + λ_class * CE``
-    """
-
-    def __init__(
-        self,
-        lambda_mask: float = 1.0,
-        lambda_class: float = 1.0,
-        dice_weight: float = 0.5,
-        bce_weight: float = 0.5,
-    ):
-        super().__init__()
-        self.lambda_mask = lambda_mask
-        self.lambda_class = lambda_class
-        self.dice_weight = dice_weight
-        self.bce_weight = bce_weight
-        self.dice = DiceLoss()
-        self.bce = nn.BCEWithLogitsLoss()
-        self.ce = nn.CrossEntropyLoss()
-
-    def forward(
-        self,
-        mask_logits: torch.Tensor,
-        class_logits: torch.Tensor,
-        mask_target: torch.Tensor,
-        class_target: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        dice_loss = self.dice(mask_logits, mask_target)
-        bce_loss = self.bce(mask_logits, mask_target)
-        mask_loss = self.dice_weight * dice_loss + self.bce_weight * bce_loss
-
-        class_loss = self.ce(class_logits, class_target)
-
-        total = self.lambda_mask * mask_loss + self.lambda_class * class_loss
-
-        return total, {
-            "loss": total,
-            "mask_loss": mask_loss,
-            "class_loss": class_loss,
-            "dice_loss": dice_loss,
-            "bce_loss": bce_loss,
-        }
-
-
-# ===================================================================
-# 2. COLLATION
-# ===================================================================
-
 def collate_fn(batch: List[dict]) -> dict:
-    """Collate dataset items into a batched dict with unified labels.
+    """Collate a list of dataset items into a mini-batch dict.
 
-    Ground-truth masks are spatially downsampled from 1024x1024 to 256x256
-    to match the mask decoder output resolution.
+    Stacks images, masks, and box prompts; maps per-dataset class labels
+    to unified 8-class vocabulary via ``map_dataset_item``.
     """
     images = torch.stack([item["image"] for item in batch])
     masks = torch.stack([item["mask"] for item in batch])
     boxes = torch.stack([item["box_prompt"] for item in batch])
-
-    # Resize masks from (B, 1, 1024, 1024) to (B, 1, 256, 256)
-    masks = torch.nn.functional.interpolate(
-        masks, size=(256, 256), mode="nearest",
-    )
-
     mapped = [map_dataset_item(item) for item in batch]
     class_labels = torch.tensor(
-        [item["class_label"] for item in mapped], dtype=torch.long
+        [item["class_label"] for item in mapped],
+        dtype=torch.long,
     )
-
     return {
         "image": images,
         "mask": masks,
@@ -138,60 +63,82 @@ def collate_fn(batch: List[dict]) -> dict:
     }
 
 
-# ===================================================================
-# 3. COMBINED DATASET
-# ===================================================================
+def build_combined_dataset(
+    root_dir: str,
+    split: str = "train",
+    max_samples: int = 0,
+) -> ConcatDataset:
+    """Load all 6 datasets for *split* and concatenate them.
 
-def build_combined_dataset(root_dir: str, split: str = "train") -> ConcatDataset:
-    """ConcatDataset of all available datasets for *split*."""
+    Returns a ``ConcatDataset`` (or ``Subset`` if *max_samples* > 0).
+    """
     datasets = []
     for ds_name in SUPPORTED_DATASETS:
         try:
             ds = UniversalIndustrialDataset(root_dir, ds_name, split=split)
             if len(ds) > 0:
                 datasets.append(ds)
-                logger.info(f"  {ds_name:20s}  {split:5s}  {len(ds):5d} samples")
+                logger.info("  %-20s  %-5s  %5d samples", ds_name, split, len(ds))
         except Exception as e:
-            logger.warning(f"  {ds_name:20s}  {split:5s}  ERROR: {e}")
-
+            logger.warning("  %-20s  %-5s  ERROR: %s", ds_name, split, e)
     if not datasets:
         raise RuntimeError(f"No datasets available for split='{split}'")
-    return ConcatDataset(datasets)
+    combined = ConcatDataset(datasets)
+    if max_samples > 0 and len(combined) > max_samples:
+        logger.info(
+            "  Truncating %s to %d samples (of %d)", split, max_samples, len(combined)
+        )
+        combined = torch.utils.data.Subset(combined, list(range(max_samples)))
+    return combined
 
-
-# ===================================================================
-# 4. TRAIN / VALIDATE
-# ===================================================================
 
 def train_one_epoch(
-    model: IndustrialSAM,
-    loader: DataLoader,
-    criterion: JointMaskClassLoss,
-    optimizer: torch.optim.Optimizer,
-    device: str,
-    clip_grad: float = 1.0,
-    grad_accum: int = 1,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
-) -> Dict[str, float]:
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    clip_grad=1.0,
+    grad_accum=1,
+    scaler=None,
+):
+    """Run one training epoch.
+
+    Returns
+    -------
+    avg_losses : dict  Aggregate average losses {"loss", "mask_loss", ...}.
+    avg_dataset : dict  Per-dataset average losses keyed by source name.
+    """
     model.train()
-    total_losses: Dict[str, float] = defaultdict(float)
+    # Keep encoder in eval mode (frozen — no dropout / batchnorm updates)
+    model.image_encoder.eval()
+
+    total_losses = defaultdict(float)
+    dataset_losses = defaultdict(lambda: defaultdict(float))
+    dataset_counts = defaultdict(int)
     num_batches = 0
     optimizer.zero_grad()
+    t_start = time.perf_counter()
 
     for batch_idx, batch in enumerate(loader):
-        image = batch["image"].to(device)
-        mask = batch["mask"].to(device)
-        boxes = batch["box_prompt"].to(device)
-        class_label = batch["class_label"].to(device)
+        image = batch["image"].to(device, non_blocking=True)
+        mask = batch["mask"].to(device, non_blocking=True)
+        boxes = batch["box_prompt"].to(device, non_blocking=True)
+        class_label = batch["class_label"].to(device, non_blocking=True)
+        sources = batch["source_dataset"]
+
+        with torch.amp.autocast("cuda", enabled=scaler is not None):
+            mask_logits, class_logits = model(image, boxes=boxes)
+            total, losses = criterion(
+                mask_logits.float(),
+                class_logits.float(),
+                mask.float(),
+                class_label,
+            )
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
-                mask_logits, class_logits = model(image, boxes=boxes)
-                total, losses = criterion(mask_logits, class_logits, mask, class_label)
             scaler.scale(total).backward()
         else:
-            mask_logits, class_logits = model(image, boxes=boxes)
-            total, losses = criterion(mask_logits, class_logits, mask, class_label)
             total.backward()
 
         if (batch_idx + 1) % grad_accum == 0:
@@ -211,25 +158,55 @@ def train_one_epoch(
             total_losses[k] += v.item()
         num_batches += 1
 
-    return {k: v / num_batches for k, v in total_losses.items()}
+        # Per-dataset accumulation (use batch size as weight)
+        bs = len(sources)
+        for i, src in enumerate(sources):
+            dataset_losses[src]["loss"] += losses["loss"].item()
+            dataset_losses[src]["mask_loss"] += losses["mask_loss"].item()
+            dataset_losses[src]["class_loss"] += losses["class_loss"].item()
+            dataset_counts[src] += 1
+
+        if (batch_idx + 1) % 20 == 0:
+            elapsed = time.perf_counter() - t_start
+            avg = total.item() / (batch_idx + 1)
+            logger.info(
+                "  train batch %d/%d  loss=%.4f  %.1fs",
+                batch_idx + 1,
+                len(loader),
+                avg,
+                elapsed,
+            )
+
+    avg_losses = {k: v / max(num_batches, 1) for k, v in total_losses.items()}
+    avg_dataset = {}
+    for src in sorted(dataset_losses):
+        cnt = dataset_counts[src]
+        avg_dataset[src] = {k: v / cnt for k, v in dataset_losses[src].items()}
+    return avg_losses, avg_dataset
 
 
 @torch.no_grad()
-def validate(
-    model: IndustrialSAM,
-    loader: DataLoader,
-    criterion: JointMaskClassLoss,
-    device: str,
-) -> Dict[str, float]:
-    model.eval()
-    total_losses: Dict[str, float] = defaultdict(float)
-    num_batches = 0
+def validate(model, loader, criterion, device):
+    """Run validation (no gradient computation).
 
-    for batch in loader:
-        image = batch["image"].to(device)
-        mask = batch["mask"].to(device)
-        boxes = batch["box_prompt"].to(device)
-        class_label = batch["class_label"].to(device)
+    Returns
+    -------
+    avg_losses : dict  Aggregate average losses.
+    avg_dataset : dict  Per-dataset average losses keyed by source name.
+    """
+    model.eval()
+    total_losses = defaultdict(float)
+    dataset_losses = defaultdict(lambda: defaultdict(float))
+    dataset_counts = defaultdict(int)
+    num_batches = 0
+    t_start = time.perf_counter()
+
+    for batch_idx, batch in enumerate(loader):
+        image = batch["image"].to(device, non_blocking=True)
+        mask = batch["mask"].to(device, non_blocking=True)
+        boxes = batch["box_prompt"].to(device, non_blocking=True)
+        class_label = batch["class_label"].to(device, non_blocking=True)
+        sources = batch["source_dataset"]
 
         mask_logits, class_logits = model(image, boxes=boxes)
         _, losses = criterion(mask_logits, class_logits, mask, class_label)
@@ -238,219 +215,310 @@ def validate(
             total_losses[k] += v.item()
         num_batches += 1
 
-    return {k: v / num_batches for k, v in total_losses.items()}
+        for i, src in enumerate(sources):
+            dataset_losses[src]["loss"] += losses["loss"].item()
+            dataset_losses[src]["mask_loss"] += losses["mask_loss"].item()
+            dataset_losses[src]["class_loss"] += losses["class_loss"].item()
+            dataset_counts[src] += 1
+
+        if (batch_idx + 1) % 20 == 0:
+            elapsed = time.perf_counter() - t_start
+            avg = total_losses["loss"] / num_batches
+            logger.info(
+                "  val   batch %d/%d  loss=%.4f  %.1fs",
+                batch_idx + 1,
+                len(loader),
+                avg,
+                elapsed,
+            )
+
+    avg_losses = {k: v / max(num_batches, 1) for k, v in total_losses.items()}
+    avg_dataset = {}
+    for src in sorted(dataset_losses):
+        cnt = dataset_counts[src]
+        avg_dataset[src] = {k: v / cnt for k, v in dataset_losses[src].items()}
+    return avg_losses, avg_dataset
 
 
-# ===================================================================
-# 5. CHECKPOINTING
-# ===================================================================
-
-def save_checkpoint(
-    model: IndustrialSAM,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
-    val_loss: float,
-    path: str,
-):
+def save_checkpoint(model, optimizer, scheduler, epoch, val_loss, path):
+    """Save model + optimizer + scheduler state to *path*."""
     ckpt = {
         "epoch": epoch,
         "val_loss": val_loss,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "class_vocab": model.class_vocab,
     }
     torch.save(ckpt, path)
-    logger.info(
-        "Checkpoint saved: %s (epoch %d, val_loss=%.4f)", path, epoch, val_loss
-    )
+    logger.info("Checkpoint saved: %s (epoch %d, val_loss=%.4f)", path, epoch, val_loss)
 
 
-def load_checkpoint(
-    path: str,
-    model: IndustrialSAM,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-) -> Tuple[int, float]:
+def load_checkpoint(path, model, optimizer=None, scheduler=None):
+    """Restore model (and optionally optimizer + scheduler) from *path*.
+
+    Returns
+    -------
+    start_epoch : int  Epoch to resume from.
+    val_loss : float   Validation loss at save time.
+    """
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer is not None:
+    if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     logger.info("Checkpoint loaded: %s (epoch %d)", path, ckpt["epoch"])
     return ckpt["epoch"], ckpt["val_loss"]
 
 
-# ===================================================================
-# 6. MAIN
-# ===================================================================
-
-def _build_optimizer(
-    model: IndustrialSAM,
-    lr_adapter: float,
-    lr_head: float,
-    lr_other: float,
-    weight_decay: float,
-) -> torch.optim.Optimizer:
-    adapter_params = []
-    head_params = []
-    other_params = []
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if _ADAPTER_PREFIX in name:
-            adapter_params.append(param)
-        elif "classifier_head" in name:
-            head_params.append(param)
-        else:
-            other_params.append(param)
-
-    logger.info(
-        "Parameter groups:  adapters=%d  head=%d  other=%d",
-        len(adapter_params), len(head_params), len(other_params),
-    )
-
-    return torch.optim.AdamW(
-        [
-            {"params": adapter_params, "lr": lr_adapter},
-            {"params": head_params, "lr": lr_head},
-            {"params": other_params, "lr": lr_other},
-        ],
-        weight_decay=weight_decay,
-    )
-
-
 def main(args):
-    # TF32 on Ampere — ~30 % faster matmuls, no accuracy loss for training
+    """Entry point: build datasets, model, optimizer, and run training loop."""
     torch.set_float32_matmul_precision("medium")
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("Device: %s", device)
     if device == "cuda":
         props = torch.cuda.get_device_properties(0)
-        logger.info("GPU: %s  VRAM: %.1f GB", torch.cuda.get_device_name(0),
-                     props.total_memory / 1024**3)
+        logger.info(
+            "GPU: %s  VRAM: %.1f GB",
+            torch.cuda.get_device_name(0),
+            props.total_memory / 1024**3,
+        )
 
-    # ── Data ──────────────────────────────────────────────────────
     logger.info("Loading datasets ...")
-    train_dataset = build_combined_dataset(args.root_dir, "train")
-    val_dataset = build_combined_dataset(args.root_dir, "val")
+    train_dataset = build_combined_dataset(args.root_dir, "train", args.max_samples)
+    val_dataset = build_combined_dataset(args.root_dir, "val", args.max_samples)
 
+    # Precompute cache — eliminates disk I/O during training
+    # Skip when max_samples is set (Subset only needs a few items, not full cache)
+    if args.max_samples == 0:
+        logger.info("Precomputing cache ...")
+        underlying = (
+            train_dataset.dataset
+            if hasattr(train_dataset, "dataset")
+            else train_dataset
+        )
+        for ds in underlying.datasets:
+            try:
+                ds.precompute_cache()
+            except MemoryError:
+                logger.warning(
+                    "Not enough RAM to cache %s — skipping cache", ds.dataset_name
+                )
+        underlying_val = (
+            val_dataset.dataset if hasattr(val_dataset, "dataset") else val_dataset
+        )
+        for ds in underlying_val.datasets:
+            try:
+                ds.precompute_cache()
+            except MemoryError:
+                logger.warning(
+                    "Not enough RAM to cache %s — skipping cache", ds.dataset_name
+                )
+        logger.info("Cache ready.")
+
+    num_workers = min(args.num_workers, os.cpu_count() or 1)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=num_workers,
+        pin_memory=device == "cuda",
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=device == "cuda",
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     logger.info("Train: %d  Val: %d", len(train_dataset), len(val_dataset))
 
-    # ── Model ─────────────────────────────────────────────────────
-    model = IndustrialSAM(args.checkpoint, device=device)
-    model.to(device)
+    model = IndustrialSAM(
+        args.checkpoint,
+        device=device,
+        train_resolution=args.train_resolution,
+    )
     logger.info(
         "Model: %d trainable params",
         sum(p.numel() for p in model.parameters() if p.requires_grad),
     )
 
-    # ── Optimiser & Loss ──────────────────────────────────────────
-    optimizer = _build_optimizer(
-        model, args.lr_adapter, args.lr_head, args.lr_other, args.weight_decay,
+    optimizer = build_optimizer(
+        model, lr=args.lr_adapter, weight_decay=args.weight_decay
+    )
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr_adapter * 0.01
     )
     criterion = JointMaskClassLoss(
-        lambda_mask=args.lambda_mask, lambda_class=args.lambda_class,
+        lambda_mask=args.lambda_mask,
+        lambda_class=args.lambda_class,
     )
 
-    # ── AMP ───────────────────────────────────────────────────────
     scaler = None
     if args.amp and device == "cuda":
-        scaler = torch.cuda.amp.GradScaler()
-        logger.info("AMP: ON  |  grad_accum: %d  |  effective batch: %d",
-                     args.grad_accum, args.batch_size * args.grad_accum)
+        scaler = torch.amp.GradScaler("cuda")
+        logger.info(
+            "AMP: ON  |  grad_accum: %d  |  effective batch: %d",
+            args.grad_accum,
+            args.batch_size * args.grad_accum,
+        )
     else:
         logger.info("AMP: OFF  |  grad_accum: %d", args.grad_accum)
 
-    # ── Training loop ─────────────────────────────────────────────
     best_val_loss = float("inf")
     start_epoch = 0
-
     if args.resume:
-        start_epoch, _ = load_checkpoint(args.resume, model, optimizer)
+        start_epoch, _ = load_checkpoint(args.resume, model, optimizer, scheduler)
 
     logger.info(
-        "Starting training  epochs=%d  batch_size=%d  lr_adapter=%.0e  lr_head=%.0e",
-        args.epochs, args.batch_size, args.lr_adapter, args.lr_head,
+        "Training: epochs=%d  batch=%d  grad_accum=%d  lr_adapter=%.0e  lr_head=%.0e  resolution=%d",
+        args.epochs,
+        args.batch_size,
+        args.grad_accum,
+        args.lr_adapter,
+        args.lr_head,
+        args.train_resolution,
     )
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.perf_counter()
-
-        train_losses = train_one_epoch(
-            model, train_loader, criterion, optimizer, device,
-            args.clip_grad, args.grad_accum, scaler,
+        current_lr = optimizer.param_groups[0]["lr"]
+        train_losses, train_ds = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            args.clip_grad,
+            args.grad_accum,
+            scaler,
         )
-        val_losses = validate(model, val_loader, criterion, device)
-
+        val_losses, val_ds = validate(model, val_loader, criterion, device)
         elapsed = time.perf_counter() - t0
 
         logger.info(
-            "E %03d/%03d  train=%.4f  val=%.4f  "
-            "mask=%.4f  cls=%.4f  dice=%.4f  bce=%.4f  %.1fs",
-            epoch + 1, args.epochs,
-            train_losses["loss"], val_losses["loss"],
-            val_losses["mask_loss"], val_losses["class_loss"],
-            val_losses["dice_loss"], val_losses["bce_loss"],
+            "E %03d/%03d  lr=%.2e  train=%.4f  val=%.4f  mask=%.4f  cls=%.4f  dice=%.4f  bce=%.4f  %.1fs",
+            epoch + 1,
+            args.epochs,
+            current_lr,
+            train_losses["loss"],
+            val_losses["loss"],
+            val_losses["mask_loss"],
+            val_losses["class_loss"],
+            val_losses["dice_loss"],
+            val_losses["bce_loss"],
             elapsed,
         )
 
+        # Per-dataset breakdown
+        if val_ds:
+            parts = []
+            for src in sorted(val_ds):
+                parts.append(f"{src}={val_ds[src]['loss']:.4f}")
+            logger.info("  val  per-dataset: %s", "  ".join(parts))
+        if train_ds:
+            parts = []
+            for src in sorted(train_ds):
+                parts.append(f"{src}={train_ds[src]['loss']:.4f}")
+            logger.info("  trn  per-dataset: %s", "  ".join(parts))
+
+        # VRAM usage
+        if device == "cuda":
+            cur = torch.cuda.memory_allocated() / 1024**2
+            peak = torch.cuda.max_memory_allocated() / 1024**2
+            logger.info("  vram  cur=%.0fMB  peak=%.0fMB", cur, peak)
+
+        scheduler.step()
+
         if val_losses["loss"] < best_val_loss:
             best_val_loss = val_losses["loss"]
-            save_checkpoint(model, optimizer, epoch, best_val_loss, args.save_path)
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, best_val_loss, args.save_path
+            )
 
-        # Aggressive cleanup for 6 GB VRAM
         if device == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
-    logger.info("Done.  Best val_loss: %.4f  Checkpoint: %s", best_val_loss, args.save_path)
+    logger.info(
+        "Done.  Best val_loss: %.4f  Checkpoint: %s",
+        best_val_loss,
+        args.save_path,
+    )
 
-
-# ===================================================================
-# 7. CLI
-# ===================================================================
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Train IndustrialSAM on all 6 defect datasets.",
     )
-    parser.add_argument("--checkpoint", default="sam_vit_b_01ec64.pth",
-                        help="Path to SAM ViT-B checkpoint")
-    parser.add_argument("--root-dir", default="D:/Dataset",
-                        help="Root directory containing all dataset folders")
-    parser.add_argument("--save-path", default="best_model.pth",
-                        help="Path to save the best checkpoint")
-    parser.add_argument("--resume", default=None,
-                        help="Resume from checkpoint path")
+    parser.add_argument(
+        "--checkpoint",
+        default="sam_vit_b_01ec64.pth",
+        help="Path to SAM ViT-B checkpoint",
+    )
+    parser.add_argument(
+        "--root-dir",
+        default="D:/Dataset",
+        help="Root directory containing all dataset folders",
+    )
+    parser.add_argument(
+        "--save-path",
+        default="best_model.pth",
+        help="Path to save the best checkpoint",
+    )
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=1,
-                        help="Per-GPU batch size (6 GB VRAM -> 1)")
-    parser.add_argument("--grad-accum", type=int, default=4,
-                        help="Gradient accumulation steps")
-    parser.add_argument("--amp", action="store_true", default=True,
-                        help="Enable AMP (mixed precision)")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Per-GPU batch size (6 GB VRAM -> 1)",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=8,
+        help="Gradient accumulation steps (8-16 for 6 GB)",
+    )
+    parser.add_argument(
+        "--train-resolution",
+        type=int,
+        default=512,
+        help="Training resolution (512 recommended for 6 GB VRAM)",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        default=True,
+        help="Enable AMP mixed precision (mandatory for 6 GB)",
+    )
+    parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--lr-adapter", type=float, default=1e-4)
     parser.add_argument("--lr-head", type=float, default=1e-3)
     parser.add_argument("--lr-other", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--lambda-mask", type=float, default=1.0)
-    parser.add_argument("--lambda-class", type=float, default=1.0)
+    parser.add_argument("--lambda-class", type=float, default=0.5)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="DataLoader workers (4-6 recommended)",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Cap dataset size (0 = use all)",
+    )
     return parser.parse_args(argv)
 
 
