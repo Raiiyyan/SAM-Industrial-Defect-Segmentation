@@ -359,7 +359,7 @@ def main(args):
     criterion = JointMaskClassLoss(
         lambda_mask=args.lambda_mask,
         lambda_class=args.lambda_class,
-    )
+    ).to(device)
 
     scaler = None
     if args.amp and device == "cuda":

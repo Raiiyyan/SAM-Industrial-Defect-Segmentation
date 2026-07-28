@@ -67,7 +67,8 @@ class JointMaskClassLoss(nn.Module):
             # Based on observed distribution: 0:0, 1:67, 2:143, 3:14, 4:20, 5:0, 6:27, 7:329
             weights = torch.tensor([1.0, 3.0, 1.5, 8.0, 6.0, 1.0, 5.0, 0.5])
             class_weights = weights / weights.sum() * len(weights)  # normalize
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.register_buffer("class_weights", class_weights)
+        self.ce = nn.CrossEntropyLoss(weight=self.class_weights)
 
     def forward(
         self,
