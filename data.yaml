@@ -1,6 +1,6 @@
-path: G:/CSE465/YOLO_Dataset
-train: images/train
-val: images/train
+path: G:/CSE465
+train: Dataset_for_training80/images
+val: Dataset_for_testing20/images
 
 nc: 1
 names: ['defect']

@@ -1,24 +1,24 @@
 from ultralytics import YOLO
 
 def main():
-    print("Initializing YOLOv8 Defect Training...")
+    print("Initializing YOLOv8 Defect Training on 80% Train / 20% Test Split...")
 
-    model = YOLO("yolov8m.pt")  # Upgrade from nano
+    model = YOLO("yolov8m.pt")
 
     results = model.train(
         data=r"G:\CSE465\data.yaml",
         epochs=100,
         imgsz=640,
-        batch=32,                  # Safe with 16GB VRAM on yolov8m
+        batch=32,
         device="0",
         name="universal_defect_v1",
-        patience=20,               # Early stopping
-        freeze=10,                 # Freeze first 10 backbone layers
-        augment=True,              # Mosaic, flips, HSV jitter, etc.
-        val=True,                  # Validate every epoch
-        save_period=10,            # Checkpoint every 10 epochs
-        cos_lr=True,               # Cosine LR schedule, smoother convergence
-        label_smoothing=0.1,       # Helps with noisy defect labels
+        patience=20,
+        freeze=10,
+        augment=True,
+        val=True,
+        save_period=10,
+        cos_lr=True,
+        label_smoothing=0.1,
         workers=8,
     )
 
