@@ -6,7 +6,7 @@ def main():
     model = YOLO("yolov8m.pt")
 
     results = model.train(
-        data=r"G:\CSE465\data.yaml",
+        data=r"G:\SAM-Industrial-Defect-Segmentation\data.yaml",
         epochs=100,
         imgsz=640,
         batch=32,

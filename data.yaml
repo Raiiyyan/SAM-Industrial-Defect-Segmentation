@@ -1,4 +1,4 @@
-path: G:/CSE465
+path: G:/SAM-Industrial-Defect-Segmentation
 train: Dataset_for_training80/images
 val: Dataset_for_testing20/images
 

@@ -6,10 +6,10 @@ import random
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
-MAIN_DATASET_ROOT = r"G:\CSE465\Datasets"
+MAIN_DATASET_ROOT = r"G:\SAM-Industrial-Defect-Segmentation\Datasets"
 
-TRAIN_ROOT = r"G:\CSE465\Dataset_for_training80"
-TEST_ROOT = r"G:\CSE465\Dataset_for_testing20"
+TRAIN_ROOT = r"G:\SAM-Industrial-Defect-Segmentation\Dataset_for_training80"
+TEST_ROOT = r"G:\SAM-Industrial-Defect-Segmentation\Dataset_for_testing20"
 
 TRAIN_IMG = os.path.join(TRAIN_ROOT, "images")
 TRAIN_LBL = os.path.join(TRAIN_ROOT, "labels")

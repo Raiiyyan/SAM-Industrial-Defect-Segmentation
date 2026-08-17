@@ -46,6 +46,8 @@ poetry.lock
 # Datasets / data (never push large data)
 # ============================================
 Datasets/
+Dataset_for_training80/
+Dataset_for_testing20/
 dataset/
 datasets/
 data/

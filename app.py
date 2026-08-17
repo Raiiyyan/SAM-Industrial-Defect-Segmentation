@@ -11,12 +11,12 @@ from segment_anything import sam_model_registry, SamPredictor
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print("Loading YOLOv8 Defect Detector...")
-YOLO_WEIGHTS = r"G:\CSE465\best.pt"
+YOLO_WEIGHTS = r"G:\SAM-Industrial-Defect-Segmentation\runs\detect\universal_defect_v1\weights\best.pt"
 yolo_model = YOLO(YOLO_WEIGHTS)
 
 print("Loading SAM (Segment Anything Model)...")
 SAM_TYPE = "vit_b"
-SAM_CHECKPOINT = r"G:\CSE465\sam_vit_b_01ec64.pth"
+SAM_CHECKPOINT = r"G:\SAM-Industrial-Defect-Segmentation\sam_vit_b_01ec64.pth"
 sam = sam_model_registry[SAM_TYPE](checkpoint=SAM_CHECKPOINT)
 sam.to(device=DEVICE)
 sam_predictor = SamPredictor(sam)
